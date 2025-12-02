@@ -46,7 +46,7 @@ ELKA_URL="https://raw.githubusercontent.com/deddosouru/scripts/main/elka-ukrasen
 
 echo "[*] Popytka zagruzit' fonovoe izobrazhenie s GitHub..."
 if command -v curl >/dev/null && curl -fsSL --max-time 15 "$ELKA_URL" -o "$BACKGROUND_FILE"; then
-  echo "✅ Fon uspeshno zagruzhен: elka-ukrasena-ognami.jpg"
+  echo " Fon uspeshno zagruzhен: elka-ukrasena-ognami.jpg"
 else
   echo "!!! Ne udalos' zagruzit' fon (net interneta / oshibka). Sozdaem chernyj fon."
   if command -v convert >/dev/null; then
