@@ -1,16 +1,13 @@
 #!/bin/bash
 set -e
 
-# Proverka: dolzhen byt' zapushen ot root ili pol'zovatelya s dostupom k su
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Skript nuzhno zapuskat' ot root (ili cherez 'su')."
-  echo "Primer: su -c './debian-usb-video-player-setup.sh'"
+  echo "OSHIBKA: ZAPUSK OT ROOT OBязATELEN!"
   exit 1
 fi
 
-OS_ID=$(grep -oP '^ID=\K.+' /etc/os-release 2>/dev/null | tr -d '"')
-if [ "$OS_ID" != "debian" ]; then
-  echo "Vnimanie: skript prednaznachen dlya Debian 12+. Prodolzhit'?"
+if [ "$(uname -m)" != "x86_64" ]; then
+  echo "Vnimanie: skript dlya x86_64 (nettop). Prodolzhit'?"
   read -p " (y/N): " -n 1 -r
   echo
   if ! [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -18,23 +15,20 @@ if [ "$OS_ID" != "debian" ]; then
   fi
 fi
 
-echo "[*] Obnovlenie paketov..."
-apt update
+echo "[*] Ustanavlivaem pakety..."
+(
+  apt update -qq 2>/dev/null || true
+  apt install -y -o DPkg::Lock::Timeout=60 \
+    xserver-xorg xinit mpv udisks2 x11-xserver-utils \
+    xterm ffmpeg gstreamer1.0-libav ntfs-3g exfat-fuse exfatprogs \
+    feh imagemagick curl 2>/dev/null || echo "Prodolzhaem bez novyh paketov."
+)
 
-echo "[*] Ustanovka zavisimostey: X11, mpv, udisks2..."
-apt install -y xserver-xorg xinit mpv udisks2 x11-xserver-utils xinit xterm
-
-# Sozdanie pol'zovatelya 'player', esli ego net
 if ! id "player" &>/dev/null; then
-  echo "[*] Sozdaem pol'zovatelya 'player'..."
-  adduser --disabled-password --gecos "" player
-  usermod -aG audio,video,input player
-else
-  echo "[*] Pol'zovatel 'player' uzhe sushchestvuet."
+  adduser --disabled-password --gecos "" player 2>/dev/null || true
 fi
+usermod -aG audio,video,input,dialout player 2>/dev/null || true
 
-# Nastrojka avtologina v tty1
-echo "[*] Nastrojka avtologina na tty1..."
 mkdir -p /etc/systemd/system/getty@tty1.service.d
 cat > /etc/systemd/system/getty@tty1.service.d/override.conf <<'EOF'
 [Service]
@@ -42,55 +36,109 @@ ExecStart=
 ExecStart=-/sbin/agetty --autologin player --noclear %I $TERM
 EOF
 
-# Sozdaem .xinitrc — osnovnoj skript dlya X sesii
-echo "[*] Sozdaem /home/player/.xinitrc..."
+# === ZAGRUZKA FONA S GITHUB ===
+BACKGROUND_DIR="/home/player/background"
+BACKGROUND_FILE="$BACKGROUND_DIR/default.jpg"
+mkdir -p "$BACKGROUND_DIR"
+chown player:player "$BACKGROUND_DIR"
+
+ELKA_URL="https://raw.githubusercontent.com/deddosouru/scripts/main/elka-ukrasena-ognami.jpg"
+
+echo "[*] Popytka zagruzit' fonovoe izobrazhenie s GitHub..."
+if command -v curl >/dev/null && curl -fsSL --max-time 15 "$ELKA_URL" -o "$BACKGROUND_FILE"; then
+  echo "✅ Fon uspeshno zagruzhен: elka-ukrasena-ognami.jpg"
+else
+  echo "!!! Ne udalos' zagruzit' fon (net interneta / oshibka). Sozdaem chernyj fon."
+  if command -v convert >/dev/null; then
+    convert -size 1920x1080 xc:black "$BACKGROUND_FILE" 2>/dev/null || {
+      echo "Ne udalos' sozdat' fon cherez ImageMagick — sozdaem pustoj fajl."
+      touch "$BACKGROUND_FILE"
+    }
+  else
+    touch "$BACKGROUND_FILE"
+  fi
+fi
+chown player:player "$BACKGROUND_FILE"
+# === KONEC ZAGRUZKI FONA ===
+
+cat > /home/player/play-videos.sh <<'EOF'
+#!/bin/bash
+exec >> /home/player/usb-watcher.log 2>&1
+set -x
+
+VIDEO_DIR="$1"
+[ -n "$VIDEO_DIR" ] && [ -d "$VIDEO_DIR" ] || { echo "Ne korrektnyj katalog"; exit 1; }
+
+pkill -f "mpv.*$VIDEO_DIR" 2>/dev/null; pkill -f "mpv --no-terminal" 2>/dev/null; sleep 2
+
+shopt -s nullglob nocaseglob
+VIDEO_FILES=("$VIDEO_DIR"/*.mp4 "$VIDEO_DIR"/*.mkv "$VIDEO_DIR"/*.avi "$VIDEO_DIR"/*.mov "$VIDEO_DIR"/*.m4v "$VIDEO_DIR"/*.flv "$VIDEO_DIR"/*.webm "$VIDEO_DIR"/*.wmv)
+VIDEO_FILES=($(for f in "${VIDEO_FILES[@]}"; do [ -f "$f" ] && echo "$f"; done))
+
+[ ${#VIDEO_FILES[@]} -gt 0 ] || { echo "Net video"; exit 1; }
+
+export DISPLAY=:0
+xset q >/dev/null || { echo "X nedostupen"; exit 1; }
+
+exec mpv --no-terminal --fs --panscan=1 --loop-playlist=inf --shuffle --hwdec=auto "${VIDEO_FILES[@]}"
+EOF
+chmod +x /home/player/play-videos.sh
+chown player:player /home/player/play-videos.sh
+
+cat > /home/player/usb-watcher.sh <<'EOF'
+#!/bin/bash
+exec >> /home/player/usb-watcher.log 2>&1
+set -x
+
+BG="/home/player/background/default.jpg"
+show_bg() { pkill -f feh 2>/dev/null; sleep 1; export DISPLAY=:0; [ -f "$BG" ] && feh --bg-fill "$BG" &; }
+stop_vid() { pkill -f mpv 2>/dev/null; sleep 2; }
+
+show_bg
+
+if command -v udevadm >/dev/null; then
+  /sbin/udevadm monitor --udev -s block 2>/dev/null | while read line; do
+    if echo "$line" | grep -q "add.*s[d-z][0-9]"; then
+      DEV=$(echo "$line" | grep -o "s[d-z][0-9]" | head -n1)
+      [ -n "$DEV" ] && [ -e "/dev/$DEV" ] && {
+        stop_vid
+        timeout 60s sudo -u player /home/player/play-videos.sh "/dev/$DEV" < /dev/tty1 > /dev/tty1 2>&1 || show_bg
+      }
+    fi
+  done
+else
+  LAST=""
+  while true; do
+    CURR=$(lsblk -ndo NAME,TYPE | awk '$2=="part" && $1 ~ /^sd[b-z][0-9]+$/ {print "/dev/"$1}' | head -n1)
+    if [ -n "$CURR" ] && [ "$CURR" != "$LAST" ]; then
+      stop_vid
+      timeout 60s sudo -u player /home/player/play-videos.sh "$CURR" < /dev/tty1 > /dev/tty1 2>&1 || show_bg
+      LAST="$CURR"
+    elif [ -z "$CURR" ] && [ -n "$LAST" ]; then
+      show_bg
+      LAST=""
+    fi
+    sleep 5
+  done
+fi
+EOF
+chmod +x /home/player/usb-watcher.sh
+chown player:player /home/player/usb-watcher.sh
+
 cat > /home/player/.xinitrc <<'EOF'
 #!/bin/bash
-xset s off
-xset -dpms
-xsetroot -cursor_name left_ptr
-
-USB_MEDIA="/media/player"
-MAX_WAIT=300
-COUNT=0
-
-while [ $COUNT -lt $MAX_WAIT ]; do
-  VIDEO_DIR=$(ls -1d "$USB_MEDIA"/*/ 2>/dev/null | head -n1)
-  if [ -n "$VIDEO_DIR" ]; then
-    break
-  fi
-  sleep 1
-  ((COUNT++))
-done
-
-if [ -z "$VIDEO_DIR" ]; then
-  xmessage -center "USB flash ne naydena ili net video!" &
-  sleep 10
-  exit 1
-fi
-
-exec mpv --no-terminal --fs --panscan=1 --loop-playlist=no --shuffle=no \
-  --hwdec=auto \
-  "$VIDEO_DIR"/*.mp4 "$VIDEO_DIR"/*.mkv "$VIDEO_DIR"/*.avi "$VIDEO_DIR"/*.mov
+export DISPLAY=:0
+xset s off 2>/dev/null; xset -dpms 2>/dev/null; xsetroot -cursor_name left_ptr 2>/dev/null
+[ -x /home/player/usb-watcher.sh ] && /home/player/usb-watcher.sh < /dev/tty1 > /dev/tty1 2>&1 &
+while true; do sleep 30; done
 EOF
-
 chmod +x /home/player/.xinitrc
 chown player:player /home/player/.xinitrc
 
-# Obnovlyaem .bashrc: zapusk startx tol'ko iz tty1
-echo "[*] Nastrojka avtozapусka X cherez .bashrc..."
-BASHRC_LINE='if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then'
-
-if grep -qF "$BASHRC_LINE" /home/player/.bashrc; then
-  echo "[*] .bashrc uzhe soderzhit blok avtozapусka — obnovlyaem..."
-  # Udalyaem staryj blok
-  sed -i '/^# Auto-start X server/,/^fi$/d' /home/player/.bashrc
-fi
-
+sed -i '/Auto-start X server/,/^fi$/d' /home/player/.bashrc 2>/dev/null || true
 cat >> /home/player/.bashrc <<'EOF'
 
-# Auto-start X server (and video player via .xinitrc) only on local tty1
-if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
+if [ -z "$DISPLAY" ] && [ -t 0 ] && [ "$(tty)" = "/dev/tty1" ]; then
   if [ -z "$PLAYER_X_STARTED" ]; then
     export PLAYER_X_STARTED=1
     sleep 2
@@ -98,24 +146,19 @@ if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
   fi
 fi
 EOF
-
 chown player:player /home/player/.bashrc
 
-# Reshaem problemu "only console users..." cherez Xwrapper
-echo "[*] Nastrojka Xwrapper dlya razresheniya X ot obychnogo pol'zovatelya..."
+mkdir -p /etc/X11
 cat > /etc/X11/Xwrapper.config <<'EOF'
 allowed_users=anybody
 needs_root_rights=yes
 EOF
 
-# Proverka ustanovki
 echo ""
-echo "✅ NASTROJKA ZAVERShENA!"
+echo "VSE GOTOVO! VASHA YOLKA — FON PO UMOLCHANIYU"
 echo ""
-echo "Chto delat' dal'she:"
-echo "1. Perезagruzite sistemу: reboot"
-echo "2. Vstav'te FAT32 USB-fleshku s video v korne"
-echo "3. Posle zagruzki (~15 sek) nachnetsya vosproizvedenie"
+echo "Fon: /home/player/background/default.jpg"
+echo "Video: zacykleno, sluchajnyj poryadok, podderzhka goryachego podklyucheniya"
+echo "Logi: /home/player/usb-watcher.log"
 echo ""
-echo "Pol'zovatel: player"
-echo "Dlya testa v ruchnuю: zaloginites' kak 'player' v TTY1 i vvedite 'startx'"
+echo "Perезagruzka: reboot"
