@@ -7,7 +7,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 if [ "$(uname -m)" != "x86_64" ]; then
-  echo "WARNING: This script is optimized for x86_64 (nettop)."
+  echo "WARNING: This script is optimized for x86_64 nettops."
   read -p "Continue anyway? (y/N): " -n 1 -r
   echo
   if ! [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -29,7 +29,7 @@ if ! id "player" &>/dev/null; then
 fi
 usermod -aG audio,video,input,dialout player 2>/dev/null || true
 
-# Configure autologin on tty1
+# Autologin on tty1
 mkdir -p /etc/systemd/system/getty@tty1.service.d
 cat > /etc/systemd/system/getty@tty1.service.d/override.conf <<'EOF'
 [Service]
@@ -37,18 +37,18 @@ ExecStart=
 ExecStart=-/sbin/agetty --autologin player --noclear %I $TERM
 EOF
 
-# === Download background image ===
+# Background image
 BACKGROUND_DIR="/home/player/background"
 BACKGROUND_FILE="$BACKGROUND_DIR/default.jpg"
 mkdir -p "$BACKGROUND_DIR"
 chown player:player "$BACKGROUND_DIR"
 
 ELKA_URL="https://raw.githubusercontent.com/deddosouru/scripts/main/elka-ukrasena-ognami.jpg"
-echo "[*] Downloading background image..."
+echo "[*] Downloading background..."
 if command -v curl >/dev/null && curl -fsSL --max-time 15 "$ELKA_URL" -o "$BACKGROUND_FILE"; then
-  echo -e "\033[1;32m[OK] Background image downloaded successfully.\033[0m"
+  echo -e "\033[1;32m[OK] Background downloaded.\033[0m"
 else
-  echo -e "\033[1;33m[!] Failed to download background. Creating black fallback.\033[0m"
+  echo -e "\033[1;33m[!] Failed. Creating black fallback.\033[0m"
   if command -v convert >/dev/null; then
     convert -size 1920x1080 xc:black "$BACKGROUND_FILE" 2>/dev/null || touch "$BACKGROUND_FILE"
   else
@@ -56,9 +56,8 @@ else
   fi
 fi
 chown player:player "$BACKGROUND_FILE"
-# === End background setup ===
 
-# === Video playback script ===
+# Video playback script
 cat > /home/player/play-videos.sh <<'EOF'
 #!/bin/bash
 exec >> /home/player/usb-watcher.log 2>&1
@@ -88,7 +87,7 @@ EOF
 chmod +x /home/player/play-videos.sh
 chown player:player /home/player/play-videos.sh
 
-# === USB watcher + debug menu ===
+# USB watcher with removable-device detection (supports sda, sdb, etc.)
 cat > /home/player/usb-watcher.sh <<'EOF'
 #!/bin/bash
 exec >> /home/player/usb-watcher.log 2>&1
@@ -98,90 +97,79 @@ BG="/home/player/background/default.jpg"
 LOG="/home/player/usb-watcher.log"
 
 show_bg() {
-  pkill -f feh 2>/dev/null
-  sleep 1
+  pkill -f feh 2>/dev/null; sleep 1
   export DISPLAY=:0
   [ -f "$BG" ] && feh --bg-fill "$BG" &
 }
 
 stop_all() {
-  pkill -f mpv 2>/dev/null
-  pkill -f feh 2>/dev/null
-  sleep 2
+  pkill -f mpv 2>/dev/null; pkill -f feh 2>/dev/null; sleep 2
 }
 
 show_bg
 
-# Debug menu (accessible via 'm' key)
-debug_menu() {
-  echo ""
-  echo "=== SYSTEM CONTROL MENU (X SESSION) ==="
-  echo "1) Restart X session"
-  echo "2) Power off system"
-  echo "3) Reboot system"
-  echo "4) View logs"
-  echo "5) Stop video and show background"
-  echo "q) Exit menu"
-  echo -n "Your choice: "
-  read choice
-  case "$choice" in
-    1) echo "Restarting X..."; pkill -f "xinit|Xorg"; sleep 2; startx & ;;
-    2) echo "Shutting down..."; sudo poweroff ;;
-    3) echo "Rebooting..."; sudo reboot ;;
-    4) echo "=== LAST 20 LOG LINES ==="; tail -n 20 "$LOG" ;;
-    5) echo "Returning to background..."; stop_all; show_bg ;;
-    q) echo "Menu closed." ;;
-    *) echo "Unknown command." ;;
-  esac
-  echo ""
-}
+# Manual debug menu trigger
+while true; do
+  if [ -f /tmp/menu-request ]; then
+    rm -f /tmp/menu-request
+    {
+      echo "=== SYSTEM CONTROL MENU ==="
+      echo "1) Restart X session"
+      echo "2) Power off"
+      echo "3) Reboot"
+      echo "4) Show last 20 log lines"
+      echo "5) Stop video, show background"
+      read -t 30 -p "Choice: " choice
+      case "$choice" in
+        1) pkill -f "xinit|Xorg"; sleep 2; sudo -u player startx & ;;
+        2) sudo poweroff ;;
+        3) sudo reboot ;;
+        4) tail -n 20 "$LOG" ;;
+        5) stop_all; show_bg ;;
+        *) echo "No action." ;;
+      esac
+    } > /dev/tty2 2>&1
+  fi
 
-# Listen for 'm' key press to trigger menu
-if command -v xev >/dev/null && command -v xinput >/dev/null; then
-  xinput list 2>/dev/null | grep -q -i "keyboard" && {
-    xev -event keyboard 2>/dev/null | while read line; do
-      if echo "$line" | grep -q '"m" key press'; then
-        echo "Key 'm' pressed — opening menu on TTY2..."
-        {
-          echo "=== CONTROL MENU ACTIVATED ==="
-          debug_menu
-        } > /dev/tty2 2>&1 &
+  # Detect removable USB partitions (ignores mmcblk*)
+  USB_PART=""
+  while IFS= read -r line; do
+    DEV=$(echo "$line" | awk '{print $1}')
+    RM=$(echo "$line" | awk '{print $2}')
+    TYPE=$(echo "$line" | awk '{print $3}')
+    NAME=$(echo "$line" | awk '{print $6}')
+    if [ "$RM" = "1" ] && [ "$TYPE" = "part" ] && [[ "$NAME" != mmcblk* ]]; then
+      USB_PART="/dev/$DEV"
+      break
+    fi
+  done < <(lsblk -r -d -o NAME,REMovable,TYPE,SIZE,MOUNTPOINT,PKNAME 2>/dev/null | tail -n +2)
+
+  if [ -n "$USB_PART" ]; then
+    MOUNT_POINT=$(lsblk -n -o MOUNTPOINT "$USB_PART" 2>/dev/null)
+    if [ -z "$MOUNT_POINT" ]; then
+      MOUNT_POINT="/mnt/usb-$(basename "$USB_PART")"
+      mkdir -p "$MOUNT_POINT"
+      if ! mount "$USB_PART" "$MOUNT_POINT" 2>/dev/null; then
+        sleep 2
+        continue
       fi
-    done &
-  }
-fi
-
-# Main USB monitoring loop
-if command -v udevadm >/dev/null; then
-  /sbin/udevadm monitor --udev -s block 2>/dev/null | while read line; do
-    if echo "$line" | grep -q "add.*s[d-z][0-9]"; then
-      DEV=$(echo "$line" | grep -o "s[d-z][0-9]" | head -n1)
-      [ -n "$DEV" ] && [ -e "/dev/$DEV" ] && {
+    fi
+    if [ -d "$MOUNT_POINT" ]; then
+      shopt -s nullglob nocaseglob
+      VIDEO_FILES=("$MOUNT_POINT"/*.mp4 "$MOUNT_POINT"/*.mkv "$MOUNT_POINT"/*.avi "$MOUNT_POINT"/*.mov)
+      if [ ${#VIDEO_FILES[@]} -gt 0 ]; then
         stop_all
-        timeout 60s sudo -u player /home/player/play-videos.sh "/dev/$DEV" < /dev/tty1 > /dev/tty1 2>&1 || show_bg
-      }
+        sudo -u player /home/player/play-videos.sh "$MOUNT_POINT" < /dev/tty1 > /dev/tty1 2>&1 &
+      fi
     fi
-  done
-else
-  LAST=""
-  while true; do
-    CURR=$(lsblk -ndo NAME,TYPE | awk '$2=="part" && $1 ~ /^sd[b-z][0-9]+$/ {print "/dev/"$1}' | head -n1)
-    if [ -n "$CURR" ] && [ "$CURR" != "$LAST" ]; then
-      stop_all
-      timeout 60s sudo -u player /home/player/play-videos.sh "$CURR" < /dev/tty1 > /dev/tty1 2>&1 || show_bg
-      LAST="$CURR"
-    elif [ -z "$CURR" ] && [ -n "$LAST" ]; then
-      show_bg
-      LAST=""
-    fi
-    sleep 5
-  done
-fi
+  fi
+  sleep 5
+done
 EOF
 chmod +x /home/player/usb-watcher.sh
 chown player:player /home/player/usb-watcher.sh
 
-# === .xinitrc (safe, LF-only) ===
+# .xinitrc
 {
   echo '#!/bin/bash'
   echo 'export DISPLAY=:0'
@@ -196,7 +184,7 @@ chown player:player /home/player/usb-watcher.sh
 chmod +x /home/player/.xinitrc
 chown player:player /home/player/.xinitrc
 
-# === .bashrc autostart ===
+# .bashrc autostart
 sed -i '/Auto-start X server/,/^fi$/d' /home/player/.bashrc 2>/dev/null || true
 cat >> /home/player/.bashrc <<'EOF'
 
@@ -210,28 +198,30 @@ fi
 EOF
 chown player:player /home/player/.bashrc
 
-# === X server permissions ===
+# X permissions
 mkdir -p /etc/X11
 cat > /etc/X11/Xwrapper.config <<'EOF'
 allowed_users=anybody
 needs_root_rights=yes
 EOF
 
-# === Allow player to reboot/poweroff without password ===
+# sudoers for player
 echo 'player ALL=(ALL) NOPASSWD: /sbin/reboot, /sbin/poweroff, /usr/bin/pkill, /usr/bin/startx' > /etc/sudoers.d/99-player-nopasswd
 chmod 440 /etc/sudoers.d/99-player-nopasswd
 
 echo ""
-echo -e "\033[1;32m[SUCCESS] Setup completed!\033[0m"
+echo -e "\033[1;32m[SUCCESS] Installation complete!\033[0m"
 echo ""
 echo "Features:"
 echo " - Background: elka-ukrasena-ognami.jpg (or black fallback)"
-echo " - Video: looped, shuffled, hot-plug USB support"
+echo " - Video: looped, shuffled, supports ANY removable USB (sda, sdb, etc.)"
+echo " - eMMC systems (mmcblk*) are correctly ignored"
 echo ""
 echo -e "\033[1;33m[INFO] Debug & Control:\033[0m"
-echo "   - Press 'm' during X session to activate control menu"
-echo "   - Switch to TTY2 (Ctrl+Alt+F2) to interact"
-echo "   - Options: restart X, power off, reboot, view logs"
+echo "   To open control menu:"
+echo "   1. Switch to TTY2 (Ctrl+Alt+F2)"
+echo "   2. Run: touch /tmp/menu-request"
+echo "   3. Follow instructions in TTY2"
 echo ""
 echo "Logs: /home/player/usb-watcher.log"
-echo "Reboot to apply: sudo reboot"
+echo "Reboot to apply all changes."
