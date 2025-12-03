@@ -7,21 +7,21 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 if [ "$(uname -m)" != "x86_64" ]; then
-  echo "WARNING: This script is optimized for x86_64 nettops."
-  read -p "Continue anyway? (y/N): " -n 1 -r
+  echo "WARNING: Optimized for x86_64 nettops."
+  read -p "Continue? (y/N): " -n 1 -r
   echo
   if ! [[ $REPLY =~ ^[Yy]$ ]]; then
     exit 1
   fi
 fi
 
-echo "[*] Installing required packages..."
+echo "[*] Installing packages..."
 (
   apt update -qq 2>/dev/null || true
   apt install -y -o DPkg::Lock::Timeout=60 \
     xserver-xorg xinit mpv udisks2 x11-xserver-utils \
     xterm ffmpeg gstreamer1.0-libav ntfs-3g exfat-fuse exfatprogs \
-    feh imagemagick curl x11-utils 2>/dev/null || echo "Continuing with available packages."
+    feh imagemagick curl x11-utils xosd-bin 2>/dev/null || echo "Continuing."
 )
 
 if ! id "player" &>/dev/null; then
@@ -37,7 +37,7 @@ ExecStart=
 ExecStart=-/sbin/agetty --autologin player --noclear %I $TERM
 EOF
 
-# Background image
+# Background
 BACKGROUND_DIR="/home/player/background"
 BACKGROUND_FILE="$BACKGROUND_DIR/default.jpg"
 mkdir -p "$BACKGROUND_DIR"
@@ -57,7 +57,7 @@ else
 fi
 chown player:player "$BACKGROUND_FILE"
 
-# Video playback script
+# Video playback script — WITH loop and shuffle
 cat > /home/player/play-videos.sh <<'EOF'
 #!/bin/bash
 exec >> /home/player/usb-watcher.log 2>&1
@@ -82,12 +82,13 @@ VIDEO_FILES=($(for f in "${VIDEO_FILES[@]}"; do [ -f "$f" ] && echo "$f"; done))
 export DISPLAY=:0
 xset q >/dev/null || exit 1
 
+# LOOP + SHUFFLE ENABLED
 exec mpv --no-terminal --fs --panscan=1 --loop-playlist=inf --shuffle --hwdec=auto "${VIDEO_FILES[@]}"
 EOF
 chmod +x /home/player/play-videos.sh
 chown player:player /home/player/play-videos.sh
 
-# USB watcher with removable-device detection (supports sda, sdb, etc.)
+# USB watcher with OSD/xmessage fallback and sda/mmcblk fix
 cat > /home/player/usb-watcher.sh <<'EOF'
 #!/bin/bash
 exec >> /home/player/usb-watcher.log 2>&1
@@ -96,10 +97,29 @@ set -x
 BG="/home/player/background/default.jpg"
 LOG="/home/player/usb-watcher.log"
 
+# Determine OSD method
+if command -v osd_cat >/dev/null && [ -n "$DISPLAY" ]; then
+  use_osd="yes"
+else
+  use_osd="no"
+fi
+
+# Unified notification function
+notify() {
+  local msg="$1"
+  export DISPLAY=:0
+  if [ "$use_osd" = "yes" ]; then
+    echo "$msg" | osd_cat -p top -A center -d 4 -f "-*-*-*-*-*-*-24-*-*-*-*-*-*-*" 2>/dev/null &
+  else
+    timeout 4 xmessage -center "$msg" 2>/dev/null &
+  fi
+}
+
 show_bg() {
   pkill -f feh 2>/dev/null; sleep 1
   export DISPLAY=:0
   [ -f "$BG" ] && feh --bg-fill "$BG" &
+  notify "Background displayed"
 }
 
 stop_all() {
@@ -108,30 +128,30 @@ stop_all() {
 
 show_bg
 
-# Manual debug menu trigger
+# Manual menu
 while true; do
   if [ -f /tmp/menu-request ]; then
     rm -f /tmp/menu-request
     {
       echo "=== SYSTEM CONTROL MENU ==="
-      echo "1) Restart X session"
+      echo "1) Restart X"
       echo "2) Power off"
       echo "3) Reboot"
-      echo "4) Show last 20 log lines"
-      echo "5) Stop video, show background"
+      echo "4) Show logs"
+      echo "5) Show background"
       read -t 30 -p "Choice: " choice
       case "$choice" in
-        1) pkill -f "xinit|Xorg"; sleep 2; sudo -u player startx & ;;
-        2) sudo poweroff ;;
-        3) sudo reboot ;;
-        4) tail -n 20 "$LOG" ;;
+        1) notify "Restarting X..."; pkill -f "xinit|Xorg"; sleep 2; sudo -u player startx & ;;
+        2) notify "Shutting down..."; sudo poweroff ;;
+        3) notify "Rebooting..."; sudo reboot ;;
+        4) tail -n 20 "$LOG" > /dev/tty2 ;;
         5) stop_all; show_bg ;;
-        *) echo "No action." ;;
+        *) echo "Cancelled." ;;
       esac
     } > /dev/tty2 2>&1
   fi
 
-  # Detect removable USB partitions (ignores mmcblk*)
+  # Detect REMOVABLE USB (supports sda, sdb, etc.; ignores mmcblk*)
   USB_PART=""
   while IFS= read -r line; do
     DEV=$(echo "$line" | awk '{print $1}')
@@ -145,24 +165,33 @@ while true; do
   done < <(lsblk -r -d -o NAME,REMovable,TYPE,SIZE,MOUNTPOINT,PKNAME 2>/dev/null | tail -n +2)
 
   if [ -n "$USB_PART" ]; then
+    notify "USB detected: $USB_PART"
     MOUNT_POINT=$(lsblk -n -o MOUNTPOINT "$USB_PART" 2>/dev/null)
     if [ -z "$MOUNT_POINT" ]; then
       MOUNT_POINT="/mnt/usb-$(basename "$USB_PART")"
       mkdir -p "$MOUNT_POINT"
-      if ! mount "$USB_PART" "$MOUNT_POINT" 2>/dev/null; then
+      if mount "$USB_PART" "$MOUNT_POINT" 2>/dev/null; then
+        notify "Mounted: $MOUNT_POINT"
+      else
+        notify "Mount failed: $USB_PART"
         sleep 2
         continue
       fi
     fi
+
     if [ -d "$MOUNT_POINT" ]; then
       shopt -s nullglob nocaseglob
       VIDEO_FILES=("$MOUNT_POINT"/*.mp4 "$MOUNT_POINT"/*.mkv "$MOUNT_POINT"/*.avi "$MOUNT_POINT"/*.mov)
       if [ ${#VIDEO_FILES[@]} -gt 0 ]; then
+        notify "Found ${#VIDEO_FILES[@]} video(s). Starting looped shuffle playback..."
         stop_all
         sudo -u player /home/player/play-videos.sh "$MOUNT_POINT" < /dev/tty1 > /dev/tty1 2>&1 &
+      else
+        notify "No video files in $MOUNT_POINT"
       fi
     fi
   fi
+
   sleep 5
 done
 EOF
@@ -184,7 +213,7 @@ chown player:player /home/player/usb-watcher.sh
 chmod +x /home/player/.xinitrc
 chown player:player /home/player/.xinitrc
 
-# .bashrc autostart
+# .bashrc
 sed -i '/Auto-start X server/,/^fi$/d' /home/player/.bashrc 2>/dev/null || true
 cat >> /home/player/.bashrc <<'EOF'
 
@@ -205,23 +234,20 @@ allowed_users=anybody
 needs_root_rights=yes
 EOF
 
-# sudoers for player
+# sudoers
 echo 'player ALL=(ALL) NOPASSWD: /sbin/reboot, /sbin/poweroff, /usr/bin/pkill, /usr/bin/startx' > /etc/sudoers.d/99-player-nopasswd
 chmod 440 /etc/sudoers.d/99-player-nopasswd
 
 echo ""
-echo -e "\033[1;32m[SUCCESS] Installation complete!\033[0m"
+echo -e "\033[1;32m[SUCCESS] Setup complete!\033[0m"
 echo ""
 echo "Features:"
-echo " - Background: elka-ukrasena-ognami.jpg (or black fallback)"
-echo " - Video: looped, shuffled, supports ANY removable USB (sda, sdb, etc.)"
-echo " - eMMC systems (mmcblk*) are correctly ignored"
+echo " - Loop playback + shuffle enabled"
+echo " - Supports ANY removable USB (sda, sdb, etc.)"
+echo " - eMMC (mmcblk*) correctly ignored"
+echo " - On-screen debug messages (osd_cat or xmessage)"
 echo ""
-echo -e "\033[1;33m[INFO] Debug & Control:\033[0m"
-echo "   To open control menu:"
-echo "   1. Switch to TTY2 (Ctrl+Alt+F2)"
-echo "   2. Run: touch /tmp/menu-request"
-echo "   3. Follow instructions in TTY2"
+echo -e "\033[1;33m[INFO] Control:\033[0m"
+echo "   TTY2: touch /tmp/menu-request → manage system"
 echo ""
-echo "Logs: /home/player/usb-watcher.log"
-echo "Reboot to apply all changes."
+echo "Reboot to apply: sudo reboot"
