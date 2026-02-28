@@ -1,0 +1,136 @@
+#!/bin/bash
+
+# Интерактивный скрипт установки Arch Linux
+
+# Показать список дисков
+echo "Доступные диски:"
+lsblk -d -e 11 | grep disk | awk '{print $1, $4}'
+echo
+
+# Запрос информации у пользователя
+read -p "Введите диск для установки (например, /dev/sda): " DISK
+read -p "Введите имя пользователя: " USERNAME
+read -p "Введите пароль для пользователя: " USERPASS
+read -sp "Введите пароль для root: " ROOTPASS
+echo
+read -p "Введите имя хоста: " HOSTNAME
+read -p "Введите размер swap файла в ГБ (по умолчанию 4): " SWAP_SIZE
+SWAP_SIZE=${SWAP_SIZE:-4}
+read -p "Введите часовой пояс (по умолчанию Europe/Moscow): " TIMEZONE
+TIMEZONE=${TIMEZONE:-Europe/Moscow}
+
+# Проверка диска
+if [ ! -b "$DISK" ]; then
+    echo "Ошибка: $DISK не существует"
+    exit 1
+fi
+
+# Подтверждение перед началом
+echo "Установка на $DISK. Продолжить? (y/N)"
+read -r CONFIRM
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    exit 0
+fi
+
+# Параметры разделов
+BOOT_SIZE="512M"
+ROOT_SIZE="100%"  # Оставшееся пространство
+
+# Форматирование диска (без swap раздела)
+sgdisk --zap-all $DISK
+sgdisk -n 1:0:+$BOOT_SIZE -t 1:ef00 $DISK
+sgdisk -n 2:0:0 -t 2:8300 $DISK
+
+# Создание файловых систем
+mkfs.fat -F32 ${DISK}1
+mkfs.ext4 ${DISK}2
+
+# Монтирование
+mount ${DISK}2 /mnt
+mkdir -p /mnt/boot
+mount ${DISK}1 /mnt/boot
+
+# Установка базовой системы с KDE и LTS ядром
+pacstrap /mnt base linux-lts linux-firmware nano networkmanager \
+         plasma dolphin konsole gwenview geany sddm xorg-xwayland \
+         ttf-liberation ttf-dejavu sudo git reflector \
+         grub efibootmgr os-prober dosfstools mtools \
+         pipewire pipewire-alsa pipewire-pulse alsa-utils \
+         nvidia-lts nvidia-utils
+
+# Генерация fstab
+genfstab -U /mnt >> /mnt/etc/fstab
+
+# Настройка системы в chroot
+arch-chroot /mnt << EOF
+# Часовой пояс
+ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+hwclock --systohc
+
+# Локализация
+echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+echo "ru_RU.UTF-8 UTF-8" >> /etc/locale.gen
+locale-gen
+echo 'LANG=ru_RU.UTF-8' > /etc/locale.conf
+echo 'KEYMAP=ru' > /etc/vconsole.conf
+echo 'FONT=cyr-sun16' >> /etc/vconsole.conf
+
+# Сетевые настройки
+echo '$HOSTNAME' > /etc/hostname
+
+# hosts файл
+cat >> /etc/hosts << HOSTS
+127.0.0.1	localhost
+::1		localhost
+127.0.1.1	$HOSTNAME.localdomain	$HOSTNAME
+HOSTS
+
+# Загрузчик
+bootctl install
+
+# Создание файла загрузки
+cat > /boot/loader/entries/arch.conf << BOOTENTRY
+title    Arch Linux
+linux    /vmlinuz-linux-lts
+initrd   /initramfs-linux-lts.img
+options  root=${DISK}2 rw quiet splash nvidia-drm.modeset=1
+BOOTENTRY
+
+# Включение сервисов
+systemctl enable NetworkManager
+systemctl enable sddm
+# Включение PipeWire
+systemctl enable pipewire.service
+systemctl enable pipewire-pulse.service
+# Отключение PulseAudio если он был установлен как зависимость
+systemctl --global disable pulseaudio.socket pulseaudio.service
+
+# Создание swap файла
+fallocate -l ${SWAP_SIZE}G /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+# Создание пользователя
+useradd -m -G wheel,audio,video,storage,power -s /bin/bash $USERNAME
+echo '$USERNAME:$USERPASS' | chpasswd
+echo 'root:$ROOTPASS' | chpasswd
+echo '%wheel ALL=(ALL) ALL' >> /etc/sudoers
+
+# Обновление зеркал
+reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
+
+# Установка GRUB как резервного загрузчика
+grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+grub-mkconfig -o /boot/grub/grub.cfg
+
+exit
+EOF
+
+# Раскомментировать нужную локаль в /mnt/etc/pacman.d/mirrorlist
+sed -i 's/#Server/Server/g' /mnt/etc/pacman.d/mirrorlist
+
+umount -R /mnt
+
+echo "Установка завершена!"
