@@ -7,16 +7,22 @@ echo "Доступные диски:"
 lsblk -d -e 11 | grep disk | awk '{print $1, $4}'
 echo
 
+# Функция для получения ввода с терминала
+get_input() {
+    exec < /dev/tty
+    read -p "$1" input
+    echo $input
+}
+
 # Запрос информации у пользователя
-read -p "Введите диск для установки (например, /dev/sda): " DISK
-read -p "Введите имя пользователя: " USERNAME
-read -p "Введите пароль для пользователя: " USERPASS
-read -sp "Введите пароль для root: " ROOTPASS
-echo
-read -p "Введите имя хоста: " HOSTNAME
-read -p "Введите размер swap файла в ГБ (по умолчанию 4): " SWAP_SIZE
+DISK=$(get_input "Введите диск для установки (например, /dev/sda): ")
+USERNAME=$(get_input "Введите имя пользователя: ")
+USERPASS=$(get_input "Введите пароль для пользователя: ")
+ROOTPASS=$(get_input "Введите пароль для root: ")
+HOSTNAME=$(get_input "Введите имя хоста: ")
+SWAP_SIZE=$(get_input "Введите размер swap файла в ГБ (по умолчанию 4): ")
 SWAP_SIZE=${SWAP_SIZE:-4}
-read -p "Введите часовой пояс (по умолчанию Europe/Moscow): " TIMEZONE
+TIMEZONE=$(get_input "Введите часовой пояс (по умолчанию Europe/Moscow): ")
 TIMEZONE=${TIMEZONE:-Europe/Moscow}
 
 # Проверка диска
